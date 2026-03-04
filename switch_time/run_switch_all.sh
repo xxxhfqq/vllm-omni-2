@@ -157,17 +157,21 @@ stop_server_and_measure() {
   python3 -c "print(round($T1 - $T0, 2))"
 }
 
+# 停服后等待端口释放（/v1/models 不再 200），最多等 120s，超时则报错退出
 wait_port_released() {
   local port="$1"
+  local max_wait=120
   local i=0
-  while [ $i -lt 5 ]; do
+  while [ $i -lt "$max_wait" ]; do
     if ! curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1:${port}/v1/models" 2>/dev/null | grep -q 200; then
       return 0
     fi
     sleep 1
     i=$((i + 1))
+    [ $((i % 30)) -eq 0 ] && [ $i -gt 0 ] && echo "    wait_port_released ${i}s..." >&2
   done
-  echo "  [注意] 端口 ${port} 在 5s 内仍返回 200，继续后续步骤"
+  echo "ERROR: 端口 ${port} 在 ${max_wait}s 内仍返回 200，未释放，退出" >&2
+  exit 1
 }
 
 log_error_full() {
