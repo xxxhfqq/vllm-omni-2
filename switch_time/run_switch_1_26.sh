@@ -107,12 +107,14 @@ wait_ready() {
   return 1
 }
 
-# 停掉进程并等待完全退出，返回 Stop 耗时（秒）。用 wait 精确等到进程退出，避免 sleep 轮询误差。
+# 停掉进程组并等待完全退出，返回 Stop 耗时（秒）。vllm 会起多子进程，仅 kill 主进程会导致端口仍被占用，
+# 故用 setsid 启动使整组可杀；停止时 kill -TERM -$pid 杀整组，再 wait 主进程。
 stop_server_and_measure() {
   local pid="$1"
   local T0 T1
+  [ -z "$pid" ] && return
   T0=$(date +%s.%N)
-  kill "$pid" 2>/dev/null || true
+  kill -TERM -"$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
   wait "$pid" 2>/dev/null || true
   T1=$(date +%s.%N)
   python3 -c "print(round($T1 - $T0, 2))"
@@ -132,24 +134,24 @@ wait_port_released() {
   echo "  [注意] 端口 ${port} 在 5s 内仍返回 200，可能尚未完全释放，继续后续步骤"
 }
 
-# 启动配置 1（1 GPU），后台运行，输出 PID
+# 启动配置 1（1 GPU），用 setsid 使 vllm 及其子进程同属一进程组，停服时可整组 kill 释放端口
 start_config_1() {
   local port="$1"
   local log="$2"
   export CUDA_VISIBLE_DEVICES=0
-  vllm serve "$MODEL" --omni --port "$port" >> "$log" 2>&1 &
+  setsid vllm serve "$MODEL" --omni --port "$port" >> "$log" 2>&1 &
   echo $!
 }
 
-# 启动配置 26（8 GPU, SP=8，与说明表统一用 --ulysses-degree），可选 FP8
+# 启动配置 26（8 GPU, SP=8），同上用 setsid
 start_config_26() {
   local port="$1"
   local log="$2"
   export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
   if [ "$QUANT_FP8_26" = "1" ]; then
-    vllm serve "$MODEL" --omni --port "$port" --ulysses-degree 8 --quantization-config '{"method":"fp8"}' >> "$log" 2>&1 &
+    setsid vllm serve "$MODEL" --omni --port "$port" --ulysses-degree 8 --quantization-config '{"method":"fp8"}' >> "$log" 2>&1 &
   else
-    vllm serve "$MODEL" --omni --port "$port" --ulysses-degree 8 >> "$log" 2>&1 &
+    setsid vllm serve "$MODEL" --omni --port "$port" --ulysses-degree 8 >> "$log" 2>&1 &
   fi
   echo $!
 }

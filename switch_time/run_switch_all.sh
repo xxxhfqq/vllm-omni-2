@@ -118,13 +118,13 @@ get_config_params() {
   echo "export CUDA_VISIBLE_DEVICES=\"$devs\"; CONFIG_EXTRA=\"$extra\""
 }
 
-# 启动指定编号的配置，后台运行，返回 PID
+# 启动指定编号的配置，用 setsid 使 vllm 及其子进程同属一进程组，停服时可整组 kill 释放端口
 start_config_id() {
   local id="$1"
   local port="$2"
   local log="$3"
   eval "$(get_config_params "$id")"
-  eval vllm serve '"$MODEL"' --omni --port '"$port"' $CONFIG_EXTRA >> '"$log"' 2>&1 &
+  eval setsid vllm serve '"$MODEL"' --omni --port '"$port"' $CONFIG_EXTRA >> '"$log"' 2>&1 &
   echo $!
 }
 
@@ -145,11 +145,13 @@ wait_ready() {
   return 1
 }
 
+# 停掉进程组（vllm 多子进程），用 kill -TERM -$pid 杀整组以便端口释放；start_config_id 已用 setsid 启动
 stop_server_and_measure() {
   local pid="$1"
   local T0 T1
+  [ -z "$pid" ] && return
   T0=$(date +%s.%N)
-  kill "$pid" 2>/dev/null || true
+  kill -TERM -"$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
   wait "$pid" 2>/dev/null || true
   T1=$(date +%s.%N)
   python3 -c "print(round($T1 - $T0, 2))"
