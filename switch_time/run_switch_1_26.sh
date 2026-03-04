@@ -32,8 +32,12 @@ if [ -z "$HF_HOME" ]; then
   fi
 fi
 
-# 本脚本所在目录 = switch_time；仓库根 = 上一级
-WORK_DIR="$(cd "$(dirname "$0")" && pwd)"
+# 工作目录：sbatch 时 Slurm 在计算节点可能从副本执行，$0 指向无写权限的 /var/spool/slurmd/…，故优先用提交目录
+if [ -n "${SLURM_SUBMIT_DIR}" ]; then
+  WORK_DIR="${SLURM_SUBMIT_DIR}"
+else
+  WORK_DIR="$(cd "$(dirname "$0")" && pwd)"
+fi
 REPO_DIR="${REPO_DIR:-$(cd "$WORK_DIR/.." && pwd)}"
 LOG_DIR="${WORK_DIR}/logs"
 mkdir -p "$LOG_DIR"

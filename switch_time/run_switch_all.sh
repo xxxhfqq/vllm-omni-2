@@ -29,7 +29,12 @@ if [ -z "$HF_HOME" ]; then
   fi
 fi
 
-WORK_DIR="$(cd "$(dirname "$0")" && pwd)"
+# sbatch 时优先用提交目录，避免在 /var/spool/slurmd/… 下建 logs 导致 Permission denied
+if [ -n "${SLURM_SUBMIT_DIR}" ]; then
+  WORK_DIR="${SLURM_SUBMIT_DIR}"
+else
+  WORK_DIR="$(cd "$(dirname "$0")" && pwd)"
+fi
 REPO_DIR="${REPO_DIR:-$(cd "$WORK_DIR/.." && pwd)}"
 LOG_DIR="${WORK_DIR}/logs"
 mkdir -p "$LOG_DIR"
