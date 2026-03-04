@@ -1,5 +1,5 @@
 #!/bin/bash
-# 特性切换耗时测试：按测试表「分开测」— 配置 1 测完再测配置 2，依次到 26。每种配置独立：首次启动（单独记录）+ 20 次「停→起」样本。
+# 特性切换耗时测试：按测试表「分开测」— 配置 1 测完再测配置 2，依次到 26。每种配置独立：首次启动（单独记录）+ 10 次「停→起」样本（共 11 次/配置）。
 # 不向实例发推理请求，仅轮询 /v1/models 判定就绪。依赖同目录 setup_env.sh。
 # 用法：bash run_switch_all.sh 或 sbatch run_switch_all.sh
 # 作业管理参考：https://saids.hpc.gleamoe.com/
@@ -42,7 +42,7 @@ mkdir -p "$LOG_DIR"
 MODEL="${MODEL:-Qwen/Qwen-Image}"
 PORT="${PORT:-8099}"
 # 每个配置：1 次首次启动（单独记录）+ NUM_SAMPLES 次「停→起」用于 Stop/Startup/Switch 的 mean/std
-NUM_SAMPLES="${NUM_SAMPLES:-20}"
+NUM_SAMPLES="${NUM_SAMPLES:-10}"
 NUM_CONFIGS=26
 
 CONDA_ENV="${CONDA_ENV:-vllm_omni}"
@@ -118,14 +118,21 @@ get_config_params() {
   echo "export CUDA_VISIBLE_DEVICES=\"$devs\"; CONFIG_EXTRA=\"$extra\""
 }
 
-# 启动指定编号的配置，用 setsid 使 vllm 及其子进程同属一进程组，停服时可整组 kill 释放端口
+# 启动指定编号的配置，返回 PGID（进程组 ID）供 stop 按组杀；不用 eval 包整条命令，减少 $! 不可靠
 start_config_id() {
   local id="$1"
   local port="$2"
   local log="$3"
   eval "$(get_config_params "$id")"
-  eval setsid vllm serve '"$MODEL"' --omni --port '"$port"' $CONFIG_EXTRA >> '"$log"' 2>&1 &
-  echo $!
+  setsid vllm serve "$MODEL" --omni --port "$port" $CONFIG_EXTRA >> "$log" 2>&1 &
+  local leader_pid=$!
+  local pgid
+  pgid=$(ps -o pgid= -p "$leader_pid" 2>/dev/null | tr -d ' ')
+  if [ -z "$pgid" ]; then
+    echo "$leader_pid"
+  else
+    echo "$pgid"
+  fi
 }
 
 wait_ready() {
@@ -145,32 +152,78 @@ wait_ready() {
   return 1
 }
 
-# 停掉进程组（vllm 多子进程），用 kill -TERM -$pid 杀整组以便端口释放；start_config_id 已用 setsid 启动
+# 停服：按 PGID 杀整组，等进程组清空（不等 wait $pid），超时则 SIGKILL；避免“父死子活”残留
 stop_server_and_measure() {
-  local pid="$1"
+  local pgid="$1"
+  [ -z "$pgid" ] && return
   local T0 T1
-  [ -z "$pid" ] && return
   T0=$(date +%s.%N)
-  kill -TERM -"$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
-  wait "$pid" 2>/dev/null || true
+  kill -TERM -"$pgid" 2>/dev/null || true
+  local i=0
+  while [ $i -lt 60 ]; do
+    if ! ps -eo pgid=,pid= 2>/dev/null | awk -v p="$pgid" '$1+0==p+0 {c++} END {exit (c>0)?1:0}'; then
+      break
+    fi
+    sleep 0.5
+    i=$((i + 1))
+  done
+  if ! ps -eo pgid=,pid= 2>/dev/null | awk -v p="$pgid" '$1+0==p+0 {c++} END {exit (c>0)?1:0}'; then
+    kill -KILL -"$pgid" 2>/dev/null || true
+    local j=0
+    while [ $j -lt 25 ]; do
+      if ! ps -eo pgid=,pid= 2>/dev/null | awk -v p="$pgid" '$1+0==p+0 {c++} END {exit (c>0)?1:0}'; then
+        break
+      fi
+      sleep 0.2
+      j=$((j + 1))
+    done
+  fi
   T1=$(date +%s.%N)
   python3 -c "print(round($T1 - $T0, 2))"
 }
 
-# 停服后等待端口释放（/v1/models 不再 200），最多等 120s，超时则报错退出
+# 清理本用户在 GPU 上的 python/vllm 残留（multiprocessing.spawn 孤儿 PPID=1 等），不依赖 lsof/fuser
+cleanup_gpu_residuals() {
+  local pids
+  pids=$(nvidia-smi --query-compute-apps=pid,process_name --format=csv,noheader 2>/dev/null | awk -F',' '{print $1}' | tr -d ' ')
+  [ -z "$pids" ] && return 0
+  local my_pids=""
+  for p in $pids; do
+    if ps -o user= -p "$p" 2>/dev/null | grep -q "^$(whoami)$"; then
+      my_pids="$my_pids $p"
+    fi
+  done
+  [ -z "$my_pids" ] && return 0
+  kill -TERM $my_pids 2>/dev/null || true
+  sleep 1
+  kill -KILL $my_pids 2>/dev/null || true
+}
+
+# 按端口强制杀掉仍占用该端口的进程（兜底）
+force_kill_port() {
+  local port="$1"
+  fuser -k "${port}/tcp" 2>/dev/null || true
+  lsof -t -i ":${port}" 2>/dev/null | while read -r p; do kill -9 "$p" 2>/dev/null; done
+  sleep 2
+}
+
+# 停服后等待端口释放：先用 ss 判断无 LISTEN，再（可选）curl 不 200；最多 120s
 wait_port_released() {
   local port="$1"
   local max_wait=120
   local i=0
   while [ $i -lt "$max_wait" ]; do
-    if ! curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1:${port}/v1/models" 2>/dev/null | grep -q 200; then
+    if ! ss -ltnp 2>/dev/null | grep -q ":${port} "; then
       return 0
     fi
     sleep 1
     i=$((i + 1))
     [ $((i % 30)) -eq 0 ] && [ $i -gt 0 ] && echo "    wait_port_released ${i}s..." >&2
   done
-  echo "ERROR: 端口 ${port} 在 ${max_wait}s 内仍返回 200，未释放，退出" >&2
+  echo "  [最后尝试] 按端口强制清理后退出" >&2
+  force_kill_port "$port"
+  cleanup_gpu_residuals
+  echo "ERROR: 端口 ${port} 在 ${max_wait}s 内仍返回 200 或 ss 仍见 LISTEN，未释放，退出" >&2
   exit 1
 }
 
@@ -197,12 +250,14 @@ for config_id in $(seq 1 "$NUM_CONFIGS"); do
   SERVER_LOG="${LOG_DIR}/server_c${config_id}_${JOBID}.log"
 
   # ---------- 首次启动：单独记录，不参与 mean/std ----------
-  pid=$(start_config_id "$config_id" "$PORT" "$SERVER_LOG")
-  echo "  [首次启动] config $config_id started pid=$pid"
+  pgid=$(start_config_id "$config_id" "$PORT" "$SERVER_LOG")
+  echo "  [首次启动] config $config_id started pgid=$pgid"
   T_start=$(date +%s.%N)
   wait_poll=$(wait_ready "http://127.0.0.1:${PORT}" 7200) || wait_poll="-1"
   if [ "$wait_poll" = "-1" ]; then
-    kill $pid 2>/dev/null; wait $pid 2>/dev/null || true
+    kill -KILL -"$pgid" 2>/dev/null || true
+    force_kill_port "$PORT"
+    cleanup_gpu_residuals
     log_error_full "config $config_id 首次启动 failed to become ready" "$SERVER_LOG"
     echo "$config_id,0,ERROR,,,,$wait_poll" >> "$CSV"
     sleep 2
@@ -212,24 +267,28 @@ for config_id in $(seq 1 "$NUM_CONFIGS"); do
   echo "  [首次启动] ready in ${first_startup_s}s  ready_poll=${wait_poll}s"
   echo "$config_id,0,$first_startup_s,,,,$wait_poll" >> "$CSV"
 
-  # ---------- 20 次「停→起」样本（用于 Stop/Startup/Switch 的 mean/std）----------
+  # ---------- NUM_SAMPLES 次「停→起」样本（用于 Stop/Startup/Switch 的 mean/std）----------
   for run in $(seq 1 "$NUM_SAMPLES"); do
     echo "  --- 样本 $run / $NUM_SAMPLES ---"
-    if [ -n "$pid" ]; then
-      stop_s=$(stop_server_and_measure "$pid")
+    if [ -n "$pgid" ]; then
+      stop_s=$(stop_server_and_measure "$pgid")
+      cleanup_gpu_residuals
+      force_kill_port "$PORT"
       wait_port_released "$PORT"
       sleep 2
     else
       stop_s=""
     fi
     T_start=$(date +%s.%N)
-    pid=$(start_config_id "$config_id" "$PORT" "$SERVER_LOG")
+    pgid=$(start_config_id "$config_id" "$PORT" "$SERVER_LOG")
     wait_poll=$(wait_ready "http://127.0.0.1:${PORT}" 7200) || wait_poll="-1"
     if [ "$wait_poll" = "-1" ]; then
-      kill $pid 2>/dev/null; wait $pid 2>/dev/null || true
+      kill -KILL -"$pgid" 2>/dev/null || true
+      force_kill_port "$PORT"
+      cleanup_gpu_residuals
       log_error_full "config $config_id run $run failed to become ready" "$SERVER_LOG"
       echo "$config_id,$run,,ERROR,ERROR,ERROR,ERROR" >> "$CSV"
-      pid=""
+      pgid=""
       sleep 2
       continue
     fi
@@ -245,8 +304,10 @@ for config_id in $(seq 1 "$NUM_CONFIGS"); do
   done
 
   # 本配置测完，停掉进程再测下一配置
-  if [ -n "$pid" ]; then
-    stop_server_and_measure "$pid" >/dev/null
+  if [ -n "$pgid" ]; then
+    stop_server_and_measure "$pgid" >/dev/null
+    cleanup_gpu_residuals
+    force_kill_port "$PORT"
     wait_port_released "$PORT"
   fi
   sleep 2
