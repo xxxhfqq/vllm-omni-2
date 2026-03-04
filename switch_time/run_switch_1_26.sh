@@ -4,7 +4,8 @@
 # 重要：不向实例发送任何推理请求（不调用 T2I/生成接口），仅轮询 /v1/models 判定就绪。
 # 用法：直接 bash run_switch_1_26.sh 或 sbatch 提交；脚本会自动调用同目录下的 setup_env.sh 准备环境。
 # 作业管理参考：https://saids.hpc.gleamoe.com/
-# A100 资源推荐（见官网）：每 1 张 GPU 搭配 16 核 CPU、128 GB 内存 → 8 卡：128 核、1024 GB
+# A100 资源：按你集群实际调整。若提交报 Memory/node configuration not available，请用 sinfo -p A100 查看上限后改下面三行。
+# 示例：8 卡时官网推荐 128 核、1024G；不少集群单节点为 512G，故默认 512G、64 核，你可改为 --mem=1024G --cpus-per-task=128
 #SBATCH -J switch_1_26
 #SBATCH -o %j_switch_1_26.out
 #SBATCH -e %j_switch_1_26.err
@@ -12,8 +13,8 @@
 #SBATCH --qos=normal
 #SBATCH -N 1
 #SBATCH -n 1
-#SBATCH --cpus-per-task=128
-#SBATCH --mem=1024G
+#SBATCH --cpus-per-task=64
+#SBATCH --mem=512G
 #SBATCH --gres=gpu:8
 #SBATCH -t 48:00:00
 

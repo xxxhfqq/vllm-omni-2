@@ -3,7 +3,7 @@
 # 不向实例发推理请求，仅轮询 /v1/models 判定就绪。依赖同目录 setup_env.sh。
 # 用法：bash run_switch_all.sh 或 sbatch run_switch_all.sh
 # 作业管理参考：https://saids.hpc.gleamoe.com/
-# A100：每 1 张 GPU 搭配 16 核 CPU、128 GB 内存 → 8 卡：128 核、1024 GB
+# A100 资源：按你集群实际调整。若提交报 Memory/node configuration not available，请 sinfo -p A100 查看后改下面两行。
 #SBATCH -J switch_all
 #SBATCH -o %j_switch_all.out
 #SBATCH -e %j_switch_all.err
@@ -11,8 +11,8 @@
 #SBATCH --qos=normal
 #SBATCH -N 1
 #SBATCH -n 1
-#SBATCH --cpus-per-task=128
-#SBATCH --mem=1024G
+#SBATCH --cpus-per-task=64
+#SBATCH --mem=512G
 #SBATCH --gres=gpu:8
 #SBATCH -t 72:00:00
 
